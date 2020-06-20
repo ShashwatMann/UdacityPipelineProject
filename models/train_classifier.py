@@ -1,129 +1,210 @@
 import sys
-import nltk
-import numpy as np
-nltk.download(['punkt', 'wordnet'])
-from nltk.tokenize import word_tokenize, RegexpTokenizer
-from nltk.stem import WordNetLemmatizer
 import pandas as pd
+import numpy as np
+import pickle
 from sqlalchemy import create_engine
 import re
-from sklearn.pipeline import Pipeline
-from sklearn.ensemble import RandomForestClassifier
+import nltk
+from sklearn.base import BaseEstimator, TransformerMixin
+from sklearn.model_selection import train_test_split
 from sklearn.multioutput import MultiOutputClassifier
-from sklearn.model_selection import train_test_split, GridSearchCV
+from sklearn.ensemble import AdaBoostClassifier
 from sklearn.feature_extraction.text import CountVectorizer, TfidfTransformer
-from sklearn.metrics import classification_report
-from sklearn.tree import DecisionTreeClassifier
-import pickle
+from nltk.tokenize import word_tokenize
+from nltk.stem import WordNetLemmatizer
+from sklearn.pipeline import Pipeline, FeatureUnion
+from sklearn.metrics import fbeta_score, classification_report
+from scipy.stats.mstats import gmean
+
+nltk.download(['punkt', 'wordnet', 'averaged_perceptron_tagger'])
+
 
 def load_data(database_filepath):
-    """Load the filepath and return the data"""
-    name = 'sqlite:///' + database_filepath
-    engine = create_engine(name)
-    df = pd.read_sql_table('Disasters', con=engine) # is table always called this? 
-    print(df.head())
+    """
+    Load Data Function
+    
+    Arguments:
+        database_filepath -> path to SQLite db
+    Output:
+        X -> feature DataFrame
+        Y -> label DataFrame
+        category_names -> used for data visualization (app)
+    """
+    engine = create_engine('sqlite:///'+database_filepath)
+    df = pd.read_sql_table('df',engine)
     X = df['message']
-    y = df[df.columns[4:]]
-    category_names = y.columns
-    return X, y, category_names
+    Y = df.iloc[:,4:]
+    category_names = Y.columns
+    return X, Y, category_names
 
 
 def tokenize(text):
-    """Tokenize text (a disaster message).
-    Args:
-        text: String. A disaster message.
-        lemmatizer: nltk.stem.Lemmatizer.
-    Returns:
-        list. It contains tokens.
+    """
+    Tokenize function
+    
+    Arguments:
+        text -> list of text messages (english)
+    Output:
+        clean_tokens -> tokenized text, clean for ML modeling
     """
     url_regex = 'http[s]?://(?:[a-zA-Z]|[0-9]|[$-_@.&+]|[!*\(\),]|(?:%[0-9a-fA-F][0-9a-fA-F]))+'
-
-    # Detect URLs
     detected_urls = re.findall(url_regex, text)
     for url in detected_urls:
-        text = text.replace(url, 'urlplaceholder')
+        text = text.replace(url, "urlplaceholder")
 
-    # Normalize and tokenize
-    tokens = nltk.word_tokenize(re.sub(r"[^a-zA-Z0-9]", " ", text.lower()))
+    tokens = word_tokenize(text)
+    lemmatizer = WordNetLemmatizer()
 
-    # Remove stopwords
-    tokens = [t for t in tokens if t not in stopwords.words('english')]
+    clean_tokens = []
+    for tok in tokens:
+        clean_tok = lemmatizer.lemmatize(tok).lower().strip()
+        clean_tokens.append(clean_tok)
 
-    # Lemmatize
-    tokens = [lemmatizer.lemmatize(t) for t in tokens]
+    return clean_tokens
 
-    return tokens
+class StartingVerbExtractor(BaseEstimator, TransformerMixin):
+    """
+    Starting Verb Extractor class
+    
+    This class extract the starting verb of a sentence,
+    creating a new feature for the ML classifier
+    """
 
+    def starting_verb(self, text):
+        sentence_list = nltk.sent_tokenize(text)
+        for sentence in sentence_list:
+            pos_tags = nltk.pos_tag(tokenize(sentence))
+            first_word, first_tag = pos_tags[0]
+            if first_tag in ['VB', 'VBP'] or first_word == 'RT':
+                return True
+        return False
+
+    def fit(self, X, y=None):
+        return self
+
+    def transform(self, X):
+        X_tagged = pd.Series(X).apply(self.starting_verb)
+        return pd.DataFrame(X_tagged)
 
 def build_model():
-    """Build model.
-    Returns:
-        pipline: sklearn.model_selection.GridSearchCV. It contains a sklearn estimator.
     """
-    # Set pipeline
-    pipeline = Pipeline([
-        ('vect', CountVectorizer(tokenizer=tokenize)),
-        ('tfidf', TfidfTransformer()),
-        ('clf', MultiOutputClassifier(
-            AdaBoostClassifier(
-                base_estimator=DecisionTreeClassifier(max_depth=1, class_weight='balanced'),
-                learning_rate=0.3,
-                n_estimators=200
-            )
-        ))
+    Build Model function
+    
+    This function output is a Scikit ML Pipeline that process text messages
+    according to NLP best-practice and apply a classifier.
+    """
+    model = Pipeline([
+        ('features', FeatureUnion([
+
+            ('text_pipeline', Pipeline([
+                ('vect', CountVectorizer(tokenizer=tokenize)),
+                ('tfidf', TfidfTransformer())
+            ])),
+
+            ('starting_verb', StartingVerbExtractor())
+        ])),
+
+        ('clf', MultiOutputClassifier(AdaBoostClassifier()))
     ])
 
-    # Set parameters for gird search
-    parameters = {
-        'clf__estimator__learning_rate': [0.1, 0.3],
-        'clf__estimator__n_estimators': [100, 200]
-    }
+    return model
 
-    # Set grid search
-    cv = GridSearchCV(estimator=pipeline, param_grid=parameters, cv=3, scoring='f1_weighted', verbose=3)
+def multioutput_fscore(y_true,y_pred,beta=1):
+    """
+    MultiOutput Fscore
+    
+    This is a performance metric of my own creation.
+    It is a sort of geometric mean of the fbeta_score, computed on each label.
+    
+    It is compatible with multi-label and multi-class problems.
+    It features some peculiarities (geometric mean, 100% removal...) to exclude
+    trivial solutions and deliberatly under-estimate a stangd fbeta_score average.
+    The aim is avoiding issues when dealing with multi-class/multi-label imbalanced cases.
+    
+    It can be used as scorer for GridSearchCV:
+        scorer = make_scorer(multioutput_fscore,beta=1)
+        
+    Arguments:
+        y_true -> labels
+        y_prod -> predictions
+        beta -> beta value of fscore metric
+    
+    Output:
+        f1score -> customized fscore
+    """
+    score_list = []
+    if isinstance(y_pred, pd.DataFrame) == True:
+        y_pred = y_pred.values
+    if isinstance(y_true, pd.DataFrame) == True:
+        y_true = y_true.values
+    for column in range(0,y_true.shape[1]):
+        score = fbeta_score(y_true[:,column],y_pred[:,column],beta,average='weighted')
+        score_list.append(score)
+    f1score_numpy = np.asarray(score_list)
+    f1score_numpy = f1score_numpy[f1score_numpy<1]
+    f1score = gmean(f1score_numpy)
+    return  f1score
 
-    return cv
+def evaluate_model(model, X_test, Y_test, category_names):
+    """
+    Evaluate Model function
+    
+    This function applies ML pipeline to a test set and prints out
+    model performance (accuracy and f1score)
+    
+    Arguments:
+        model -> Scikit ML Pipeline
+        X_test -> test features
+        Y_test -> test labels
+        category_names -> label names (multi-output)
+    """
+    Y_pred = model.predict(X_test)
+    
+    multi_f1 = multioutput_fscore(Y_test,Y_pred, beta = 1)
+    overall_accuracy = (Y_pred == Y_test).mean().mean()
+
+    print('Average overall accuracy {0:.2f}% \n'.format(overall_accuracy*100))
+    print('F1 score (custom definition) {0:.2f}%\n'.format(multi_f1*100))
+
+    # Print the whole classification report.
+    # Extremely long output
+    # Work In Progress: Save Output as Text file!
+    
+    #Y_pred = pd.DataFrame(Y_pred, columns = Y_test.columns)
+    
+    #for column in Y_test.columns:
+    #    print('Model Performance with Category: {}'.format(column))
+    #    print(classification_report(Y_test[column],Y_pred[column]))
+    pass
 
 
 def save_model(model, model_filepath):
-    """Save stats
-    Args;
-        X: numpy.ndarray. Disaster messages.
-        Y: numpy.ndarray. Disaster categories for each messages.
-        category_names: Disaster category names.
-        vocaburary_stats_filepath: String. Vocaburary stats is saved as pickel into this file.
-        category_stats_filepath: String. Category stats is saved as pickel into this file.
     """
-    # Check vocabulary
-    vect = CountVectorizer(tokenizer=tokenize)
-    X_vectorized = vect.fit_transform(X)
-
-    # Convert vocabulary into pandas.dataframe
-    keys, values = [], []
-    for k, v in vect.vocabulary_.items():
-        keys.append(k)
-        values.append(v)
-    vocabulary_df = pd.DataFrame.from_dict({'words': keys, 'counts': values})
-
-    # Vocabulary stats
-    vocabulary_df = vocabulary_df.sample(30, random_state=72).sort_values('counts', ascending=False)
-    vocabulary_counts = list(vocabulary_df['counts'])
-    vocabulary_words = list(vocabulary_df['words'])
-
-    # Save vocaburaly stats
-    with open(vocabulary_stats_filepath, 'wb') as vocabulary_stats_file:
-        pickle.dump((vocabulary_counts, vocabulary_words), vocabulary_stats_file)
-
-    # Category stats
-    category_counts = list(Y.sum(axis=0))
-
-    # Save category stats
-    with open(category_stats_filepath, 'wb') as category_stats_file:
-        pickle.dump((category_counts, list(category_names)), category_stats_file)
-
+    Save Model function
+    
+    This function saves trained model as Pickle file, to be loaded later.
+    
+    Arguments:
+        model -> GridSearchCV or Scikit Pipelin object
+        model_filepath -> destination path to save .pkl file
+    
+    """
+    filename = model_filepath
+    pickle.dump(model, open(filename, 'wb'))
+    pass
 
 
 def main():
+    """
+    Train Classifier Main function
+    
+    This function applies the Machine Learning Pipeline:
+        1) Extract data from SQLite db
+        2) Train ML model on training set
+        3) Estimate model performance on test set
+        4) Save trained model as Pickle
+    
+    """
     if len(sys.argv) == 3:
         database_filepath, model_filepath = sys.argv[1:]
         print('Loading data...\n    DATABASE: {}'.format(database_filepath))
